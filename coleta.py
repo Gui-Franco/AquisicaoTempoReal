@@ -1,98 +1,136 @@
 import serial
+import re
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-import collections
-import re  
+from collections import deque
+import time
+import threading
 
-COM_PORT = 'COM3' 
-BAUD_RATE = 115200
-SAMPLES_DISPLAY = 100
+# --- CONFIGURAÇÕES FIXAS (NÃO ALTERAR) ---
+PORTA_SERIAL = 'COM3'  
+BAUD_RATE = 115200  # Travado conforme o padrão do seu prj.conf
+MAX_AMOSTRAS = 200 
 
-# Limites fixos para o eixo Y (Aceleração)
-Y_MIN = -20
-Y_MAX = 20
+# Buffers de dados compartilhados entre as threads
+tempos = deque(maxlen=MAX_AMOSTRAS)
+eixo_xr = deque(maxlen=MAX_AMOSTRAS)
+eixo_yr = deque(maxlen=MAX_AMOSTRAS)
+eixo_zr = deque(maxlen=MAX_AMOSTRAS)
+eixo_xf = deque(maxlen=MAX_AMOSTRAS)
+eixo_yf = deque(maxlen=MAX_AMOSTRAS)
+eixo_zf = deque(maxlen=MAX_AMOSTRAS)
 
-# Inicialização apenas dos buffers dos eixos originais
-buffers = {
-    'xr': collections.deque(maxlen=SAMPLES_DISPLAY),
-    'yr': collections.deque(maxlen=SAMPLES_DISPLAY),
-    'zr': collections.deque(maxlen=SAMPLES_DISPLAY)
-}
+padrao_regex = re.compile(
+    r"T:(\d+)\s+XR:([+-]?\d+)\s+YR:([+-]?\d+)\s+ZR:([+-]?\d+)\s+XF:([+-]?\d+)\s+YF:([+-]?\d+)\s+ZF:([+-]?\d+)"
+)
+
+# Variáveis de controle
+contador_amostras = 0
+ultimo_tempo_hz = time.time()
+rodando = True
 
 try:
-    ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=0.1)
+    ser = serial.Serial(PORTA_SERIAL, BAUD_RATE, timeout=0.01)
     ser.reset_input_buffer()
-    print(f"Conectado com sucesso na porta {COM_PORT}!")
+    print(f"Conectado em {PORTA_SERIAL} a {BAUD_RATE} bps.")
 except Exception as e:
-    print(f"Erro ao abrir a porta serial {COM_PORT}: {e}")
+    print(f"Erro ao abrir serial: {e}")
     exit()
 
-# Criação de 3 subplots verticais (um para cada eixo)
-fig, (ax_x, ax_y, ax_z) = plt.subplots(3, 1, sharex=True, figsize=(8, 10))
-fig.suptitle("Acelerômetro MMA8451Q - Dados Originais (Sem Filtro)", fontsize=14)
+# --- THREAD EXCLUSIVA PARA LEITURA DA SERIAL ---
+# Ela roda em paralelo e não deixa o buffer do Windows acumular nada
+def thread_leitura_serial():
+    global contador_amostras, rodando
+    while rodando:
+        if ser.in_waiting > 0:
+            try:
+                linha_bruta = ser.readline().decode('utf-8', errors='ignore').strip()
+                if not linha_bruta:
+                    continue
+                
+                match = padrao_regex.search(linha_bruta)
+                if match:
+                    t = int(match.group(1))
+                    xr = int(match.group(2))
+                    yr = int(match.group(3))
+                    zr = int(match.group(4))
+                    xf = int(match.group(5))
+                    yf = int(match.group(6))
+                    zf = int(match.group(7))
+                    
+                    # Armazenamento rápido nos deques
+                    tempos.append(t)
+                    eixo_xr.append(xr)
+                    eixo_yr.append(yr)
+                    eixo_zr.append(zr)
+                    eixo_xf.append(xf)
+                    eixo_yf.append(yf)
+                    eixo_zf.append(zf)
+                    
+                    contador_amostras += 1
+            except Exception:
+                pass
+        else:
+            time.sleep(0.001) # Evita uso de 100% da CPU
 
-# Linha do Eixo X
-line_xr, = ax_x.plot([], [], label='X Original', color='blue', linewidth=1.5)
-ax_x.set_ylabel("Aceleração X")
-ax_x.legend(loc='upper right')
-ax_x.grid(True)
+# Inicializa e dispara a thread de background
+thread_uart = threading.Thread(target=thread_leitura_serial, daemon=True)
+thread_uart.start()
 
-# Linha do Eixo Y
-line_yr, = ax_y.plot([], [], label='Y Original', color='green', linewidth=1.5)
-ax_y.set_ylabel("Aceleração Y")
-ax_y.legend(loc='upper right')
-ax_y.grid(True)
+# --- CONFIGURAÇÃO GRÁFICA (MATPLOTLIB OTIMIZADO) ---
+fig, (ax_x, ax_y, ax_z) = plt.subplots(3, 1, sharex=True, figsize=(10, 8))
+fig.suptitle('Filtro do Acelerômetro - Modo Multithread Otimizado', fontsize=14)
 
-# Linha do Eixo Z
-line_zr, = ax_z.plot([], [], label='Z Original', color='red', linewidth=1.5)
-ax_z.set_ylabel("Aceleração Z")
-ax_z.set_xlabel("Amostras")
-ax_z.legend(loc='upper right')
-ax_z.grid(True)
+linha_xr, = ax_x.plot([], [], label='X Raw', color='blue', alpha=0.3)
+linha_xf, = ax_x.plot([], [], label='X Filt', color='blue', linewidth=2, linestyle='--')
+linha_yr, = ax_y.plot([], [], label='Y Raw', color='green', alpha=0.3)
+linha_yf, = ax_y.plot([], [], label='Y Filt', color='green', linewidth=2, linestyle='--')
+linha_zr, = ax_z.plot([], [], label='Z Raw', color='red', alpha=0.3)
+linha_zf, = ax_z.plot([], [], label='Z Filt', color='red', linewidth=2, linestyle='--')
 
-def update(frame):
-    amostras_por_frame = 30
-    cont_leitura = 0
+for ax in [ax_x, ax_y, ax_z]:
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_ylim(-4000, 4000) # Ajuste a escala inicial se necessário
+
+def atualizar_grafico(frame):
+    global ultimo_tempo_hz, contador_amostras
     
-    while ser.in_waiting > 0 and cont_leitura < amostras_por_frame:
-        try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            cont_leitura += 1
-            
-            # Nova Regex adaptada para: "T:XXXX XR:X YR:X ZR:X | Taxa: X Hz"
-            match = re.search(r"XR:(-?\d+)\s+YR:(-?\d+)\s+ZR:(-?\d+)\s+\|\s+Taxa:\s+(\d+)\s+Hz", line)
-            
-            if match:
-                buffers['xr'].append(int(match.group(1)))
-                buffers['yr'].append(int(match.group(2)))
-                buffers['zr'].append(int(match.group(3)))
-                
-                # Opcional: Se quiser capturar a taxa para alguma lógica, ela está no match.group(4)
-                # taxa_atual = int(match.group(4))
-                
-        except Exception:
-            pass
+    tempo_atual = time.time()
+    if tempo_atual - ultimo_tempo_hz >= 1.0:
+        print(f"Taxa de Aquisição Efetiva no Python: {contador_amostras} Hz")
+        contador_amostras = 0
+        ultimo_tempo_hz = tempo_atual
 
-    # Renderiza os gráficos apenas se houver dados coletados
-    if len(buffers['xr']) > 0:
-        eixo_horizontal = list(range(len(buffers['xr'])))
+    # Apenas plota o que a outra thread já colheu, sem travar a recepção
+    if len(tempos) > 0:
+        # Copia rápida das deques para evitar conflito entre threads durante o plot
+        t_snapshot = list(tempos)
+        linha_xr.set_data(t_snapshot, list(eixo_xr))
+        linha_xf.set_data(t_snapshot, list(eixo_xf))
+        linha_yr.set_data(t_snapshot, list(eixo_yr))
+        linha_yf.set_data(t_snapshot, list(eixo_yf))
+        linha_zr.set_data(t_snapshot, list(eixo_zr))
+        linha_zf.set_data(t_snapshot, list(eixo_zf))
         
-        # Atualização dos vetores de dados de cada linha
-        line_xr.set_data(eixo_horizontal, list(buffers['xr']))
-        line_yr.set_data(eixo_horizontal, list(buffers['yr']))
-        line_zr.set_data(eixo_horizontal, list(buffers['zr']))
+        ax_x.set_xlim(t_snapshot[0], t_snapshot[-1])
         
-        # Aplicação da escala horizontal e vertical FIXA em todos os subplots
-        for ax in [ax_x, ax_y, ax_z]:
-            ax.set_xlim(0, SAMPLES_DISPLAY)
-            ax.set_ylim(Y_MIN, Y_MAX)
-                
-    return line_xr, line_yr, line_zr
+        # Auto-escala vertical leve baseada apenas no último snapshot
+        for ax, raw_data in zip([ax_x, ax_y, ax_z], [eixo_xr, eixo_yr, eixo_zr]):
+            if len(raw_data) > 0:
+                ax.set_ylim(min(raw_data) - 10, max(raw_data) + 10)
 
-# Configura a animação para atualizar a cada 30 milissegundos
-ani = animation.FuncAnimation(fig, update, interval=30, blit=False)
-plt.tight_layout()
-plt.show()
+    return linha_xr, linha_xf, linha_yr, linha_yf, linha_zr, linha_zf
 
-ser.close()
-print("Porta serial fechada.")
+# Usamos blit=True para renderização ultra veloz
+ani = animation.FuncAnimation(fig, atualizar_grafico, interval=30, blit=True, cache_frame_data=False)
+
+try:
+    plt.tight_layout()
+    plt.show()
+except KeyboardInterrupt:
+    pass
+finally:
+    rodando = False
+    thread_uart.join(timeout=1.0)
+    ser.close()
+    print("Conexão encerrada.")
